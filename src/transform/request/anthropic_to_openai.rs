@@ -1,14 +1,16 @@
+//! Anthropic 请求转换为 OpenAI 格式
+
 use crate::config::Config;
 use crate::error::{ProxyError, ProxyResult};
 use crate::models::{anthropic, openai};
-use serde_json::{json, Value};
+use crate::transform::utils::{clean_schema, parse_model_with_effort};
 
-/// Transform Anthropic request to OpenAI format
+/// 将 Anthropic 请求转换为 OpenAI 格式
 pub fn anthropic_to_openai(
     req: anthropic::AnthropicRequest,
     config: &Config,
 ) -> ProxyResult<openai::OpenAIRequest> {
-    // Determine model based on thinking parameter
+    // 根据 thinking 参数决定模型
     let has_thinking = req
         .extra
         .get("thinking")
@@ -16,8 +18,8 @@ pub fn anthropic_to_openai(
         .map(|o| o.get("type").and_then(|t| t.as_str()) == Some("enabled"))
         .unwrap_or(false);
 
-    // Use configured model or fall back to the model from the request
-    let model = if has_thinking {
+    // 使用配置的模型或请求中的模型
+    let raw_model = if has_thinking {
         config.reasoning_model.clone()
             .or_else(|| Some(req.model.clone()))
             .unwrap_or_else(|| req.model.clone())
@@ -27,10 +29,17 @@ pub fn anthropic_to_openai(
             .unwrap_or_else(|| req.model.clone())
     };
 
-    // Convert messages
+    // 解析模型名称和 effort 级别
+    let (model, reasoning_effort) = parse_model_with_effort(&raw_model);
+
+    if let Some(ref effort) = reasoning_effort {
+        tracing::debug!("Using reasoning_effort: {} for model: {}", effort, model);
+    }
+
+    // 转换消息
     let mut openai_messages = Vec::new();
 
-    // Add system message if present
+    // 添加系统消息
     if let Some(system) = req.system {
         match system {
             anthropic::SystemPrompt::Single(text) => {
@@ -56,13 +65,13 @@ pub fn anthropic_to_openai(
         }
     }
 
-    // Convert user/assistant messages
+    // 转换用户/助手消息
     for msg in req.messages {
         let converted = convert_message(msg)?;
         openai_messages.extend(converted);
     }
 
-    // Convert tools
+    // 转换工具定义
     let tools = req.tools.and_then(|tools| {
         let filtered: Vec<_> = tools
             .into_iter()
@@ -91,17 +100,18 @@ pub fn anthropic_to_openai(
     Ok(openai::OpenAIRequest {
         model,
         messages: openai_messages,
-        max_tokens: Some(req.max_tokens),
+        max_tokens: Some(req.max_tokens.max(16)), // 某些提供商要求最少 16 tokens
         temperature: req.temperature,
         top_p: req.top_p,
         stop: req.stop_sequences,
         stream: req.stream,
         tools,
         tool_choice: None,
+        reasoning_effort,
     })
 }
 
-/// Convert a single Anthropic message to one or more OpenAI messages
+/// 转换单条 Anthropic 消息为一条或多条 OpenAI 消息
 fn convert_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Message>> {
     let mut result = Vec::new();
 
@@ -149,22 +159,22 @@ fn convert_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Message>>
                         content,
                         ..
                     } => {
-                        // Tool results become separate messages with role "tool"
+                        // 工具结果转换为独立的 "tool" 角色消息
                         result.push(openai::Message {
                             role: "tool".to_string(),
-                            content: Some(openai::MessageContent::Text(content)),
+                            content: Some(openai::MessageContent::Text(content.to_string_content())),
                             tool_calls: None,
                             tool_call_id: Some(tool_use_id),
                             name: None,
                         });
                     }
                     anthropic::ContentBlock::Thinking { .. } => {
-                        // Skip thinking blocks in request
+                        // 跳过 thinking 块
                     }
                 }
             }
 
-            // Add message with content and/or tool calls
+            // 添加包含内容和/或工具调用的消息
             if !current_content_parts.is_empty() || !tool_calls.is_empty() {
                 let content = if current_content_parts.is_empty() {
                     None
@@ -197,97 +207,149 @@ fn convert_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Message>>
     Ok(result)
 }
 
-/// Clean JSON schema by removing unsupported formats
-fn clean_schema(mut schema: Value) -> Value {
-    if let Some(obj) = schema.as_object_mut() {
-        // Remove "format": "uri"
-        if obj.get("format").and_then(|v| v.as_str()) == Some("uri") {
-            obj.remove("format");
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
 
-        // Recursively clean nested schemas
-        if let Some(properties) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
-            for (_, value) in properties.iter_mut() {
-                *value = clean_schema(value.clone());
-            }
-        }
-
-        if let Some(items) = obj.get_mut("items") {
-            *items = clean_schema(items.clone());
-        }
-    }
-
-    schema
-}
-
-/// Transform OpenAI response to Anthropic format
-pub fn openai_to_anthropic(
-    resp: openai::OpenAIResponse,
-) -> ProxyResult<anthropic::AnthropicResponse> {
-    let choice = resp
-        .choices
-        .first()
-        .ok_or_else(|| ProxyError::Transform("No choices in response".to_string()))?;
-
-    let mut content = Vec::new();
-
-    // Add text content if present
-    if let Some(text) = &choice.message.content {
-        if !text.is_empty() {
-            content.push(anthropic::ResponseContent::Text {
-                content_type: "text".to_string(),
-                text: text.clone(),
-            });
+    fn create_test_config() -> Config {
+        Config {
+            port: 3000,
+            routing_mode: crate::config::RoutingMode::Transform,
+            anthropic_base_url: None,
+            anthropic_api_key: None,
+            openai_base_url: None,
+            openai_api_key: None,
+            base_url: Some("https://api.example.com".to_string()),
+            api_key: Some("test-key".to_string()),
+            reasoning_model: None,
+            completion_model: None,
+            debug: false,
+            verbose: false,
+            log_raw_json: false,
         }
     }
 
-    // Add tool calls if present
-    if let Some(tool_calls) = &choice.message.tool_calls {
-        for tool_call in tool_calls {
-            let input: Value = serde_json::from_str(&tool_call.function.arguments)
-                .unwrap_or_else(|_| json!({}));
+    #[test]
+    fn test_basic_text_conversion() {
+        let config = create_test_config();
+        let req = anthropic::AnthropicRequest {
+            model: "claude-3-sonnet".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("Hello".to_string()),
+            }],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
 
-            content.push(anthropic::ResponseContent::ToolUse {
-                content_type: "tool_use".to_string(),
-                id: tool_call.id.clone(),
-                name: tool_call.function.name.clone(),
-                input,
-            });
-        }
+        let result = anthropic_to_openai(req, &config).unwrap();
+        
+        assert_eq!(result.model, "claude-3-sonnet");
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].role, "user");
     }
 
-    let stop_reason = choice
-        .finish_reason
-        .as_ref()
-        .map(|r| match r.as_str() {
-            "tool_calls" => "tool_use",
-            "stop" => "end_turn",
-            "length" => "max_tokens",
-            _ => "end_turn",
-        })
-        .map(String::from);
+    #[test]
+    fn test_system_prompt_conversion() {
+        let config = create_test_config();
+        let req = anthropic::AnthropicRequest {
+            model: "claude-3-sonnet".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("Hello".to_string()),
+            }],
+            max_tokens: 100,
+            system: Some(anthropic::SystemPrompt::Single("You are helpful".to_string())),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
 
-    Ok(anthropic::AnthropicResponse {
-        id: resp.id,
-        response_type: "message".to_string(),
-        role: "assistant".to_string(),
-        content,
-        model: resp.model,
-        stop_reason,
-        stop_sequence: None,
-        usage: anthropic::Usage {
-            input_tokens: resp.usage.prompt_tokens,
-            output_tokens: resp.usage.completion_tokens,
-        },
-    })
-}
+        let result = anthropic_to_openai(req, &config).unwrap();
+        
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.messages[0].role, "system");
+        assert_eq!(result.messages[1].role, "user");
+    }
 
-/// Map OpenAI finish reason to Anthropic stop reason
-pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
-    finish_reason.map(|r| match r {
-        "tool_calls" => "tool_use",
-        "stop" => "end_turn",
-        "length" => "max_tokens",
-        _ => "end_turn",
-    }.to_string())
+    #[test]
+    fn test_tool_definition_conversion() {
+        let config = create_test_config();
+        let req = anthropic::AnthropicRequest {
+            model: "claude-3-sonnet".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("Search for rust".to_string()),
+            }],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: Some(vec![anthropic::Tool {
+                name: "search".to_string(),
+                description: Some("Search the web".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    }
+                }),
+                tool_type: None,
+            }]),
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let result = anthropic_to_openai(req, &config).unwrap();
+        
+        assert!(result.tools.is_some());
+        let tools = result.tools.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "search");
+    }
+
+    #[test]
+    fn test_model_override_with_thinking() {
+        let mut config = create_test_config();
+        config.reasoning_model = Some("gpt-4-turbo".to_string());
+        
+        let req = anthropic::AnthropicRequest {
+            model: "claude-3-sonnet".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("Think about this".to_string()),
+            }],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({"thinking": {"type": "enabled"}}),
+        };
+
+        let result = anthropic_to_openai(req, &config).unwrap();
+        
+        assert_eq!(result.model, "gpt-4-turbo");
+    }
 }

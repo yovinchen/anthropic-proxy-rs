@@ -26,6 +26,12 @@ pub enum ProxyError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error("Unsupported operation: {0}")]
+    UnsupportedOperation(String),
+
+    #[error("Routing error: {0}")]
+    Routing(String),
 }
 
 impl IntoResponse for ProxyError {
@@ -41,6 +47,8 @@ impl IntoResponse for ProxyError {
                 (StatusCode::BAD_GATEWAY, format!("HTTP error: {}", err))
             }
             ProxyError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ProxyError::UnsupportedOperation(msg) => (StatusCode::BAD_REQUEST, msg),
+            ProxyError::Routing(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
         let body = Json(json!({

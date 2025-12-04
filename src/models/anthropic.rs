@@ -82,7 +82,7 @@ pub enum ContentBlock {
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: ToolResultContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
@@ -90,6 +90,43 @@ pub enum ContentBlock {
     Thinking {
         thinking: String,
     },
+}
+
+/// Tool result content can be a string or array of content blocks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolResultContent {
+    Text(String),
+    Blocks(Vec<ToolResultBlock>),
+}
+
+impl ToolResultContent {
+    /// Convert to string representation
+    pub fn to_string_content(&self) -> String {
+        match self {
+            ToolResultContent::Text(s) => s.clone(),
+            ToolResultContent::Blocks(blocks) => {
+                blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ToolResultBlock::Text { text } => Some(text.clone()),
+                        ToolResultBlock::Image { .. } => Some("[image]".to_string()),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+    }
+}
+
+/// Content block types for tool results
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ToolResultBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

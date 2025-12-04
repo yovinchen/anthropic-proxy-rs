@@ -1,145 +1,14 @@
-use crate::config::Config;
-use crate::error::{ProxyError, ProxyResult};
-use crate::models::{anthropic, openai};
-use crate::transform;
-use axum::{
-    body::Body,
-    http::{HeaderMap, HeaderValue},
-    response::{IntoResponse, Response},
-    Extension, Json,
-};
+//! OpenAI 流 → Anthropic 流转换
+
+use crate::models::openai;
+use crate::transform::utils::map_stop_reason;
 use bytes::Bytes;
-use futures::stream::{Stream, StreamExt};
-use reqwest::Client;
+use futures::stream::Stream;
+use futures::StreamExt;
 use serde_json::json;
-use std::sync::Arc;
-use std::time::Duration;
 
-pub async fn proxy_handler(
-    Extension(config): Extension<Arc<Config>>,
-    Extension(client): Extension<Client>,
-    Json(req): Json<anthropic::AnthropicRequest>,
-) -> ProxyResult<Response> {
-    let is_streaming = req.stream.unwrap_or(false);
-
-    tracing::debug!("Received request for model: {}", req.model);
-    tracing::debug!("Streaming: {}", is_streaming);
-
-    if config.verbose {
-        tracing::trace!("Incoming Anthropic request: {}", serde_json::to_string_pretty(&req).unwrap_or_default());
-    }
-
-    let openai_req = transform::anthropic_to_openai(req, &config)?;
-
-    if config.verbose {
-        tracing::trace!("Transformed OpenAI request: {}", serde_json::to_string_pretty(&openai_req).unwrap_or_default());
-    }
-
-    if is_streaming {
-        handle_streaming(config, client, openai_req).await
-    } else {
-        handle_non_streaming(config, client, openai_req).await
-    }
-}
-
-async fn handle_non_streaming(
-    config: Arc<Config>,
-    client: Client,
-    openai_req: openai::OpenAIRequest,
-) -> ProxyResult<Response> {
-    let url = config.chat_completions_url();
-    tracing::debug!("Sending non-streaming request to {}", url);
-    tracing::debug!("Request model: {}", openai_req.model);
-
-    let mut req_builder = client
-        .post(&config.chat_completions_url())
-        .json(&openai_req)
-        .timeout(Duration::from_secs(300));
-
-    if let Some(api_key) = &config.api_key {
-        req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
-    }
-
-    let response = req_builder.send().await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        tracing::error!("Upstream error ({}): {}", status, error_text);
-        return Err(ProxyError::Upstream(format!(
-            "Upstream returned {}: {}",
-            status, error_text
-        )));
-    }
-
-    let openai_resp: openai::OpenAIResponse = response.json().await?;
-
-    if config.verbose {
-        tracing::trace!("Received OpenAI response: {}", serde_json::to_string_pretty(&openai_resp).unwrap_or_default());
-    }
-
-    let anthropic_resp = transform::openai_to_anthropic(openai_resp)?;
-
-    if config.verbose {
-        tracing::trace!("Transformed Anthropic response: {}", serde_json::to_string_pretty(&anthropic_resp).unwrap_or_default());
-    }
-
-    Ok(Json(anthropic_resp).into_response())
-}
-
-async fn handle_streaming(
-    config: Arc<Config>,
-    client: Client,
-    openai_req: openai::OpenAIRequest,
-) -> ProxyResult<Response> {
-    let url = config.chat_completions_url();
-    tracing::debug!("Sending streaming request to {}", url);
-    tracing::debug!("Request model: {}", openai_req.model);
-
-    let mut req_builder = client
-        .post(&config.chat_completions_url())
-        .json(&openai_req)
-        .timeout(Duration::from_secs(300));
-
-    if let Some(api_key) = &config.api_key {
-        req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
-    }
-
-    let response = req_builder.send().await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        tracing::error!(
-            "Upstream error ({}) from {}: {}", 
-            status,
-            url,
-            error_text
-        );
-        return Err(ProxyError::Upstream(format!(
-            "Upstream returned {} from {}: {}",
-            status, url, error_text
-        )));
-    }
-
-    let stream = response.bytes_stream();
-    let sse_stream = create_sse_stream(stream);
-
-    let mut headers = HeaderMap::new();
-    headers.insert("Content-Type", HeaderValue::from_static("text/event-stream"));
-    headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
-    headers.insert("Connection", HeaderValue::from_static("keep-alive"));
-
-    Ok((headers, Body::from_stream(sse_stream)).into_response())
-}
-
-fn create_sse_stream(
+/// 创建 OpenAI → Anthropic 流转换器
+pub fn create_stream(
     stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
@@ -188,25 +57,28 @@ fn create_sse_stream(
                                     }
 
                                     if let Some(choice) = chunk.choices.first() {
+                                        // 发送 message_start
                                         if !has_sent_message_start {
-                                            let event = anthropic::StreamEvent::MessageStart {
-                                                message: anthropic::MessageStartData {
-                                                    id: message_id.clone().unwrap_or_default(),
-                                                    message_type: "message".to_string(),
-                                                    role: "assistant".to_string(),
-                                                    model: current_model.clone().unwrap_or_default(),
-                                                    usage: anthropic::Usage {
-                                                        input_tokens: 0,
-                                                        output_tokens: 0,
-                                                    },
-                                                },
-                                            };
+                                            let event = json!({
+                                                "type": "message_start",
+                                                "message": {
+                                                    "id": message_id.clone().unwrap_or_default(),
+                                                    "type": "message",
+                                                    "role": "assistant",
+                                                    "model": current_model.clone().unwrap_or_default(),
+                                                    "usage": {
+                                                        "input_tokens": 0,
+                                                        "output_tokens": 0
+                                                    }
+                                                }
+                                            });
                                             let sse_data = format!("event: message_start\ndata: {}\n\n",
                                                 serde_json::to_string(&event).unwrap_or_default());
                                             yield Ok(Bytes::from(sse_data));
                                             has_sent_message_start = true;
                                         }
 
+                                        // 处理 reasoning/thinking
                                         if let Some(reasoning) = &choice.delta.reasoning {
                                             if current_block_type.is_none() {
                                                 let event = json!({
@@ -236,6 +108,7 @@ fn create_sse_stream(
                                             yield Ok(Bytes::from(sse_data));
                                         }
 
+                                        // 处理文本内容
                                         if let Some(content) = &choice.delta.content {
                                             if !content.is_empty() {
                                                 if current_block_type.as_deref() != Some("text") {
@@ -250,7 +123,6 @@ fn create_sse_stream(
                                                         content_index += 1;
                                                     }
 
-                                                    // Start text block
                                                     let event = json!({
                                                         "type": "content_block_start",
                                                         "index": content_index,
@@ -265,7 +137,6 @@ fn create_sse_stream(
                                                     current_block_type = Some("text".to_string());
                                                 }
 
-                                                // Send text delta
                                                 let event = json!({
                                                     "type": "content_block_delta",
                                                     "index": content_index,
@@ -280,11 +151,10 @@ fn create_sse_stream(
                                             }
                                         }
 
-                                        // Handle tool calls
+                                        // 处理工具调用
                                         if let Some(tool_calls) = &choice.delta.tool_calls {
                                             for tool_call in tool_calls {
                                                 if let Some(id) = &tool_call.id {
-                                                    // Start of new tool call
                                                     if current_block_type.is_some() {
                                                         let event = json!({
                                                             "type": "content_block_stop",
@@ -304,7 +174,6 @@ fn create_sse_stream(
                                                     if let Some(name) = &function.name {
                                                         _tool_call_name = Some(name.clone());
 
-                                                        // Start tool_use block
                                                         let event = json!({
                                                             "type": "content_block_start",
                                                             "index": content_index,
@@ -323,7 +192,6 @@ fn create_sse_stream(
                                                     if let Some(args) = &function.arguments {
                                                         tool_call_args.push_str(args);
 
-                                                        // Send input_json_delta
                                                         let event = json!({
                                                             "type": "content_block_delta",
                                                             "index": content_index,
@@ -340,9 +208,8 @@ fn create_sse_stream(
                                             }
                                         }
 
-                                        // Handle finish reason
+                                        // 处理完成原因
                                         if let Some(finish_reason) = &choice.finish_reason {
-                                            // Close current content block
                                             if current_block_type.is_some() {
                                                 let event = json!({
                                                     "type": "content_block_stop",
@@ -353,8 +220,7 @@ fn create_sse_stream(
                                                 yield Ok(Bytes::from(sse_data));
                                             }
 
-                                            // Send message_delta with stop_reason
-                                            let stop_reason = transform::map_stop_reason(Some(finish_reason));
+                                            let stop_reason = map_stop_reason(Some(finish_reason));
                                             let event = json!({
                                                 "type": "message_delta",
                                                 "delta": {

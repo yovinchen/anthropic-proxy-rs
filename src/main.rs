@@ -1,17 +1,20 @@
+mod backends;
 mod cli;
 mod config;
 mod error;
+mod handlers;
 mod models;
-mod proxy;
+mod router;
+mod streaming;
 mod transform;
 
 use axum::{
-    routing::post,
+    routing::{get, post},
     Extension, Router,
 };
 use clap::Parser;
 use cli::{Cli, Command};
-use config::Config;
+use config::{Config, RoutingMode};
 use daemonize::Daemonize;
 use reqwest::Client;
 use std::sync::Arc;
@@ -102,18 +105,44 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         .init();
 
     tracing::info!("Starting Anthropic Proxy v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("Routing Mode: {}", config.routing_mode);
     tracing::info!("Port: {}", config.port);
-    tracing::info!("Upstream URL: {}", config.base_url);
+
+    // 显示后端配置
+    match config.routing_mode {
+        RoutingMode::Transform => {
+            if let Some(ref url) = config.base_url {
+                tracing::info!("Upstream URL: {}", url);
+            }
+        }
+        RoutingMode::Passthrough => {
+            if let Some(ref url) = config.anthropic_base_url {
+                tracing::info!("Anthropic URL: {}", url);
+            }
+        }
+        RoutingMode::Auto | RoutingMode::Gateway => {
+            if let Some(ref url) = config.anthropic_base_url {
+                tracing::info!("Anthropic URL: {} ✓", url);
+            }
+            if let Some(ref url) = config.openai_base_url {
+                tracing::info!("OpenAI URL: {} ✓", url);
+            }
+            if let Some(ref url) = config.base_url {
+                tracing::info!("Upstream URL: {} ✓", url);
+            }
+        }
+    }
+
     if let Some(ref model) = config.reasoning_model {
         tracing::info!("Reasoning Model Override: {}", model);
     }
     if let Some(ref model) = config.completion_model {
         tracing::info!("Completion Model Override: {}", model);
     }
-    if config.api_key.is_some() {
+    if config.api_key.is_some() || config.anthropic_api_key.is_some() || config.openai_api_key.is_some() {
         tracing::info!("API Key: configured");
     } else {
-        tracing::info!("API Key: not set (using unauthenticated endpoint)");
+        tracing::info!("API Key: not set");
     }
 
     let client = Client::builder()
@@ -129,9 +158,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app = Router::new()
-        .route("/v1/messages", post(proxy::proxy_handler))
-        .route("/health", axum::routing::get(health_handler))
+    // 根据路由模式配置端点
+    let mut app = Router::new()
+        .route("/v1/messages", post(handlers::anthropic_handler))
+        .route("/health", get(health_handler));
+
+    // Auto/Gateway 模式支持 OpenAI 端点
+    if matches!(config.routing_mode, RoutingMode::Auto | RoutingMode::Gateway) {
+        app = app.route("/v1/chat/completions", post(handlers::openai_handler));
+        tracing::info!("OpenAI endpoint enabled: /v1/chat/completions");
+    }
+
+    let app = app
         .layer(Extension(config.clone()))
         .layer(Extension(client))
         .layer(TraceLayer::new_for_http())
